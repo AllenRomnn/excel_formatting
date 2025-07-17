@@ -1,0 +1,225 @@
+import os
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Font
+
+# Set folder path to DropDown_Folder inside the current working directory 
+folder_path = os.path.join(os.getcwd(), 'DropDown_Folder')
+config_path = os.path.join(folder_path, 'sheet_config.xlsx')
+
+# Output file path
+output_path = os.path.join(folder_path, 'MasterFile.xlsx')
+              
+# Read allowed sheet names
+if not os.path.exists(config_path):
+    print("Config file not found.")
+    import sys
+    sys.exit()
+
+allowed_sheets = pd.read_excel(config_path)["SheetNames"].dropna().tolist()
+
+# Prepare list for all DEPARTMENT values
+all_department_data = []
+
+# Read all Excel files except MasterFile.xlsx itself
+files = [f for f in os.listdir(folder_path) if f.endswith('.xlsx') and f != 'MasterFile.xlsx']
+
+# Column mapping for fixed columns (by zero-based index)
+column_map = {
+    0: 'DEPARTMENT',
+    1: 'EQUIPMENT # SAP',
+    2: 'EQUIPMENT NAME',
+    3: 'FREQUENCY',
+    4: '# IMES',
+    4: 'MAINTENANCE PLAN'
+    # Calibration columns handled separately below
+}
+
+# Excel letter to zero-based index converter
+def excel_col_to_index(col_letter):
+    col_letter = col_letter.upper()
+    expn = 0
+    col_index = 0
+    for char in reversed(col_letter):
+        col_index += (ord(char) - ord('A') + 1) * (26 ** expn)
+        expn += 1
+    return col_index - 1
+
+# Calibration columns mapping: letter columns per month for P, S, A types
+calibration_column_letters = {
+    'MONTH(PC)': 'L',
+    'PLAN CALIBRATION': ['M', 'P', 'S', 'V', 'Y', 'AB', 'AE', 'AH', 'AK', 'AN', 'AQ', 'AT'],
+}
+
+# Function to collect month and date values with month names as columns
+def collect_month_and_date(df, letters_list):
+    month_names = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN',
+                   'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC']
+
+    collected_data = {}
+    for i, letter in enumerate(letters_list):
+        idx = excel_col_to_index(letter)
+        month = month_names[i] if i < len(month_names) else f'Month{i+1}'
+        if idx < df.shape[1]:
+            collected_data[month] = df.iloc[:, idx]
+        else:
+            collected_data[month] = pd.Series([""] * len(df))
+    return pd.DataFrame(collected_data)
+
+# Initialize final DataFrame for collected data
+final_data = pd.DataFrame(columns=list(column_map.values()) + [
+    'MONTH(PC)',
+] + ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'])
+
+# Process files
+for file in files:
+    file_path = os.path.join(folder_path, file)
+    try:
+        xl = pd.ExcelFile(file_path)
+        for sheet in xl.sheet_names:
+            if sheet in allowed_sheets:
+                print(f"Reading: {file} -> {sheet}")
+                df = xl.parse(sheet, header=None) # just raw data
+
+                # Process only rows after row 47
+                if df.shape[0] > 46:
+                    df = df.iloc[46:].reset_index(drop=True)
+
+                    extracted_data = pd.DataFrame()
+
+                    # Extract fixed columns from df by index
+                    for col_idx, col_name in column_map.items():
+                        if col_idx < df.shape[1]:
+                            extracted_data[col_name] = df.iloc[:, col_idx]
+                        else:
+                            extracted_data[col_name] = ""
+
+                    # Extract CALIBRATION SCHEDULE (MONTH) single fixed column
+                    cs_col_idx = excel_col_to_index(calibration_column_letters['MONTH(PC)'])
+                    if cs_col_idx < df.shape[1]:
+                        extracted_data['MONTH(PC)'] = df.iloc[:, cs_col_idx]
+                    else:
+                        extracted_data['MONTH(PC)'] = ""
+
+                    # Extract PLAN CALIBRATION monthly columns and rename with months
+                    plan_df = collect_month_and_date(df, calibration_column_letters['PLAN CALIBRATION'])
+                    extracted_data = pd.concat([extracted_data, plan_df], axis=1)
+
+                    # Add file origin and append to final data
+                    extracted_data["DropDown_Folder"] = file
+                    final_data = pd.concat([final_data, extracted_data], ignore_index=True)
+
+                    # Collect DEPARTMENT values
+                    all_department_data.extend(extracted_data["DEPARTMENT"].dropna().tolist())
+            else:
+                print(f"Skipping: {file} -> {sheet}")
+    except Exception as e:
+        print(f"Error reading {file}: {e}")
+
+#---------------------------------------------------------
+# Reset # IMES column before filling
+final_data['# IMES'] = ""
+
+# New frequency (Display Mahority of its scope and # IMES grouping logic
+current_dept = None
+current_title_idx = None
+group_indices = []
+freq_values = []
+
+for idx, row in final_data.iterrows():
+    freq = row['FREQUENCY']
+    dept = row['DEPARTMENT']
+
+    if pd.isna(freq) or str(freq).strip() == "":
+        # Title row found, finalize previous group
+        if current_title_idx is not None:
+            if group_indices:
+                # Set majority frequency to the title row
+                freq_series = pd.Series(freq_values).dropna().astype(str).str.strip()
+                if not freq_series.empty:
+                    most_common_freq = freq_series.mode().iloc[0]
+                    final_data.at[current_title_idx, 'FREQUENCY'] = most_common_freq
+                final_data.at[current_title_idx, '# IMES'] = len(group_indices)
+                for gi in group_indices:
+                    final_data.at[gi, '# IMES'] = 1
+            else:
+                final_data.at[current_title_idx, '# IMES'] = 1
+
+        current_dept = dept
+        current_title_idx = idx
+        group_indices = []
+        freq_values = []
+    else:
+        if current_dept == dept:
+            group_indices.append(idx)
+            freq_values.append(freq)
+
+# Finalize last group
+if current_title_idx is not None:
+    if group_indices:
+        freq_series = pd.Series(freq_values).dropna().astype(str).str.strip()
+        if not freq_series.empty:
+            most_common_freq = freq_series.mode().iloc[0]
+            final_data.at[current_title_idx, 'FREQUENCY'] = most_common_freq
+        final_data.at[current_title_idx, '# IMES'] = len(group_indices)
+        for gi in group_indices:
+            final_data.at[gi, '# IMES'] = 1
+    else:
+        final_data.at[current_title_idx, '# IMES'] = 1
+#--------------------------------------------------------------------
+# Remove rows where all key columns are empty or whitespace except 'EQUIPMENT # SAP'
+cols_except_sap = [col for col in final_data.columns if col != 'EQUIPMENT # SAP']
+
+def is_only_sap_nonempty(row):
+    for col in cols_except_sap:
+        val = row[col]
+        if pd.notna(val) and str(val).strip() != '':
+            return False
+    sap_val = row['EQUIPMENT # SAP']
+    if pd.notna(sap_val) and str(sap_val).strip() != '':
+        return True
+    return False
+
+final_data_cleaned = final_data[~final_data.apply(is_only_sap_nonempty, axis=1)]
+
+# Save the cleaned DataFrame (make sure to disable index)
+final_data_cleaned.to_excel(output_path, index=False)
+print(f"Saved cleaned file to {output_path}")
+
+# --------------------------------- #
+#           APPLY COLORING           #
+# --------------------------------- #
+
+# Load the workbook and select active sheet first
+wb = load_workbook(output_path)
+ws = wb.active
+
+# Apply to header row (1st row)
+header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")  # Blue background
+header_font = Font(bold=True, color="FFFFFF")  # White bold text
+
+for col in range(1, ws.max_column + 1):
+    cell = ws.cell(row=1, column=col)
+    cell.fill = header_fill
+    cell.font = header_font
+
+# Apply fill to rows where MONTH (PC) is empty (starting from row 2) row 1 is for header diba
+title_fill = PatternFill(start_color="b0e0e6", end_color="b0e0e6", fill_type="solid")  # Light Yellow
+
+# Loop through rows starting from row 2 (after header)
+for row in range(2, ws.max_row + 1):
+    month_value = ws.cell(row=row, column=6).value  # Column 6 = MONTH (PC)
+    if month_value is None or str(month_value).strip() == "":
+        for col in range(1, ws.max_column + 1):
+            ws.cell(row=row, column=col).fill = title_fill
+
+# Center align all cells-------------------------
+from openpyxl.styles import Alignment
+center_alignment = Alignment(horizontal='center', vertical='center')
+for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+    for cell in row:
+        cell.alignment = center_alignment
+
+# Save the workbook after applying styles
+wb.save(output_path)
+print(f"Saved colored Excel rows to {output_path}")
